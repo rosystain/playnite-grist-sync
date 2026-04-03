@@ -1,0 +1,68 @@
+name: Build EXE
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install build tools
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pyinstaller
+
+      - name: Build executables
+        shell: pwsh
+        run: |
+          if (Test-Path build) { Remove-Item -Recurse -Force build }
+          if (Test-Path dist) { Remove-Item -Recurse -Force dist }
+
+          python -m PyInstaller --clean --noconfirm --onefile --name sync_playnite_to_grist sync_playnite_to_grist.py
+          python -m PyInstaller --clean --noconfirm --onefile --name sync_grist_to_playnite sync_grist_to_playnite.py
+          python -m PyInstaller --clean --noconfirm --onefile --name run_sync_job run_sync_job.py
+
+      - name: Prepare package
+        id: package
+        shell: pwsh
+        run: |
+          $pkg = "playnite-grist-sync-windows-x64"
+          New-Item -ItemType Directory -Path $pkg | Out-Null
+
+          Copy-Item "dist\*.exe" $pkg
+          Copy-Item "config.example.yaml" $pkg
+          if (Test-Path "run_sync_job.ps1") { Copy-Item "run_sync_job.ps1" $pkg }
+          if (Test-Path "README.md") { Copy-Item "README.md" $pkg }
+
+          $zip = "$pkg.zip"
+          if (Test-Path $zip) { Remove-Item -Force $zip }
+          Compress-Archive -Path "$pkg\*" -DestinationPath $zip
+
+          "zip=$zip" >> $env:GITHUB_OUTPUT
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: playnite-grist-sync-windows-x64
+          path: ${{ steps.package.outputs.zip }}
+
+      - name: Upload to Release
+        if: github.event_name == 'release'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ steps.package.outputs.zip }}

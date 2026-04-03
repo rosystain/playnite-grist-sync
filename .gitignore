@@ -1,0 +1,15 @@
+# Python virtual environment
+.venv/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Local secrets and runtime config
+config.yaml
+
+# Runtime outputs / state
+recent_updates.json
+recent_updates_grist.json
+sync_state.json
+sync_state_g2p.json

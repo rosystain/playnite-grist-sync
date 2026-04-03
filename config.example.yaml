@@ -1,0 +1,15 @@
+base_url: "http://localhost:19821"
+token: "PASTE_PLAYNITE_TOKEN_HERE"
+
+grist_base_url: "https://YOUR_GRIST_HOST/api"
+grist_doc_id: "PASTE_GRIST_DOC_ID_HERE"
+grist_api_key: "PASTE_GRIST_API_KEY_HERE"
+grist_table_name: "Playnite"
+
+limit: 500
+max_pages: 20
+include_hidden: true
+grist_batch_size: 200
+
+g2p_apply: false
+g2p_fields: "description,notes,releaseDate,favorite,hidden,userScore,categories,tags,features,genres,developers,publishers,series"
