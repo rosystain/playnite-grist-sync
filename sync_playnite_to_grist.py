@@ -861,6 +861,7 @@ def append_missing_choices(config: Config, rows: List[Dict[str, Any]], desired_c
 def fetch_existing_record_map(config: Config) -> Dict[str, int]:
     headers = grist_headers(config)
     record_map: Dict[str, int] = {}
+    parsed_any = False
 
     # Prefer SQL pagination because /records offset can be unreliable on some deployments.
     table_name_sql = '"' + config.grist_table_name.replace('"', '""') + '"'
@@ -881,11 +882,18 @@ def fetch_existing_record_map(config: Config) -> Dict[str, int]:
 
             sql_ok = True
             for rec in records:
-                rec_id = rec.get("id")
                 fields = rec.get("fields", {}) if isinstance(rec.get("fields"), dict) else {}
-                business_id = fields.get(BUSINESS_KEY)
-                if rec_id is not None and isinstance(business_id, str) and business_id:
-                    record_map[business_id] = int(rec_id)
+                # SQL endpoint may return selected id inside fields.id, not top-level id.
+                rec_id_raw = rec.get("id", fields.get("id"))
+                business_raw = fields.get(BUSINESS_KEY)
+                business_id = str(business_raw).strip() if business_raw is not None else ""
+                if rec_id_raw is None or not business_id:
+                    continue
+                try:
+                    record_map[business_id] = int(rec_id_raw)
+                    parsed_any = True
+                except (TypeError, ValueError):
+                    continue
 
             if len(records) < page_size:
                 break
@@ -900,11 +908,25 @@ def fetch_existing_record_map(config: Config) -> Dict[str, int]:
     payload = http_json("GET", grist_url(config, f"/tables/{config.grist_table_name}/records"), headers)
     records = payload.get("records", [])
     for rec in records:
-        rec_id = rec.get("id")
         fields = rec.get("fields", {}) if isinstance(rec.get("fields"), dict) else {}
-        business_id = fields.get(BUSINESS_KEY)
-        if rec_id is not None and isinstance(business_id, str) and business_id:
-            record_map[business_id] = int(rec_id)
+        rec_id_raw = rec.get("id", fields.get("id"))
+        business_raw = fields.get(BUSINESS_KEY)
+        business_id = str(business_raw).strip() if business_raw is not None else ""
+        if rec_id_raw is None or not business_id:
+            continue
+        try:
+            record_map[business_id] = int(rec_id_raw)
+            parsed_any = True
+        except (TypeError, ValueError):
+            continue
+
+    # Safety guard: if Grist returns rows but no business key mapping can be parsed,
+    # fail fast to avoid silently treating all source rows as new inserts.
+    if records and not parsed_any:
+        raise RuntimeError(
+            "Failed to parse existing Grist record ids/business keys from /records response. "
+            "Aborting to prevent duplicate inserts."
+        )
 
     return record_map
 

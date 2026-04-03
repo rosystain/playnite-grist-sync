@@ -11,5 +11,5 @@ max_pages: 20
 include_hidden: true
 grist_batch_size: 200
 
-g2p_apply: false
+g2p_enabled: false
 g2p_fields: "description,notes,releaseDate,favorite,hidden,userScore,categories,tags,features,genres,developers,publishers,series"

@@ -33,9 +33,7 @@ jobs:
           if (Test-Path build) { Remove-Item -Recurse -Force build }
           if (Test-Path dist) { Remove-Item -Recurse -Force dist }
 
-          python -m PyInstaller --clean --noconfirm --onefile --name sync_playnite_to_grist sync_playnite_to_grist.py
-          python -m PyInstaller --clean --noconfirm --onefile --name sync_grist_to_playnite sync_grist_to_playnite.py
-          python -m PyInstaller --clean --noconfirm --onefile --name run_sync_job run_sync_job.py
+          python -m PyInstaller --clean --noconfirm --onefile --windowed --name run_sync_job run_sync_job.py
 
       - name: Prepare package
         id: package

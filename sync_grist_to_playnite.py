@@ -19,7 +19,7 @@ import json
 import re
 import sys
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.error import HTTPError, URLError
@@ -82,11 +82,9 @@ class Config:
     grist_batch_size: int
     g2p_state_path: str
     g2p_fields: List[str]
-    g2p_apply: bool
     g2p_max_pages: int
     g2p_allow_when_playnite_modified_missing: bool
     g2p_incremental_cutoff: bool
-    g2p_edited_after_sync_grace_seconds: int
 
 
 def parse_bool(raw: str) -> bool:
@@ -168,15 +166,11 @@ def load_config(path: Path) -> Config:
         grist_batch_size=int(raw["grist_batch_size"]),
         g2p_state_path=str(raw.get("g2p_state_path", "sync_state_g2p.json")),
         g2p_fields=parse_csv_fields(raw.get("g2p_fields")),
-        g2p_apply=bool(raw.get("g2p_apply", False)),
         g2p_max_pages=int(raw.get("g2p_max_pages", 2000)),
         g2p_allow_when_playnite_modified_missing=bool(
             raw.get("g2p_allow_when_playnite_modified_missing", True)
         ),
         g2p_incremental_cutoff=bool(raw.get("g2p_incremental_cutoff", True)),
-        g2p_edited_after_sync_grace_seconds=int(
-            raw.get("g2p_edited_after_sync_grace_seconds", 300)
-        ),
     )
 
     if not cfg.token:
@@ -187,8 +181,6 @@ def load_config(path: Path) -> Config:
         raise ConfigError("grist_batch_size must be > 0")
     if cfg.g2p_max_pages <= 0:
         raise ConfigError("g2p_max_pages must be > 0")
-    if cfg.g2p_edited_after_sync_grace_seconds < 0:
-        raise ConfigError("g2p_edited_after_sync_grace_seconds must be >= 0")
 
     return cfg
 
@@ -624,18 +616,16 @@ def should_apply(
     synced_at: Any,
     playnite_modified: Any,
     allow_when_playnite_missing: bool,
-    edited_after_sync_grace_seconds: int,
 ) -> bool:
     edited = parse_iso_datetime(edited_at)
     synced = parse_iso_datetime(synced_at)
     # Treat missing/invalid editedAt as infinitely old.
     if edited is None:
         return False
-    # Synced timestamp must exist. Use a grace window to avoid treating
-    # initialization timing drift as manual edits.
+    # Synced timestamp must exist.
     if synced is None:
         return False
-    if edited <= synced + timedelta(seconds=edited_after_sync_grace_seconds):
+    if edited <= synced:
         return False
     p = parse_iso_datetime(playnite_modified)
     if p is None:
@@ -649,10 +639,11 @@ def main() -> int:
     try:
         args = parse_args()
         cfg = load_config(Path(args.config))
+        apply_mode = True
         if args.apply:
-            cfg.g2p_apply = True
+            apply_mode = True
         elif args.dry_run:
-            cfg.g2p_apply = False
+            apply_mode = False
         state_path = Path(cfg.g2p_state_path)
         prev_state = load_g2p_state(state_path)
         previous_cutoff = load_g2p_edited_watermark(state_path) if cfg.g2p_incremental_cutoff else None
@@ -705,7 +696,6 @@ def main() -> int:
                 fields.get("syncedAt"),
                 playnite_modified_map.get(game_id),
                 cfg.g2p_allow_when_playnite_modified_missing,
-                cfg.g2p_edited_after_sync_grace_seconds,
             ):
                 # Consume baseline on policy-skip rows to prevent repeated changed-noise.
                 # Future user edits will still produce a new fingerprint and be re-evaluated.
@@ -714,7 +704,7 @@ def main() -> int:
                 print(f"{display_name}({game_id}) SKIP_POLICY")
                 continue
 
-            if cfg.g2p_apply:
+            if apply_mode:
                 update_playnite_game(cfg, game_id, payload)
                 # Advance baseline only on successful apply.
                 next_state[game_id] = fp
@@ -744,7 +734,7 @@ def main() -> int:
         return 1
 
     print("G2P sync completed.")
-    print(f"Apply mode: {'ON' if cfg.g2p_apply else 'OFF (dry)'}")
+    print(f"Apply mode: {'ON' if apply_mode else 'OFF (dry)'}")
     print(f"Scanned records: {scanned}")
     print(f"Changed fingerprints: {changed}")
     print(f"Applied to Playnite: {applied}")

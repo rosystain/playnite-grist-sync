@@ -16,15 +16,7 @@ if (Test-Path "dist") { Remove-Item -Recurse -Force "dist" }
 if (Test-Path $OutputDir) { Remove-Item -Recurse -Force $OutputDir }
 New-Item -ItemType Directory -Path $OutputDir | Out-Null
 
-$targets = @(
-    "sync_playnite_to_grist.py",
-    "sync_grist_to_playnite.py",
-    "run_sync_job.py"
-)
-
-foreach ($t in $targets) {
-    & $PythonExe -m PyInstaller --clean --noconfirm --onefile --name ([System.IO.Path]::GetFileNameWithoutExtension($t)) $t
-}
+& $PythonExe -m PyInstaller --clean --noconfirm --onefile --windowed --name run_sync_job run_sync_job.py
 
 Copy-Item "dist\*.exe" $OutputDir
 Copy-Item "config.example.yaml" $OutputDir

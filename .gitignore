@@ -13,3 +13,12 @@ recent_updates.json
 recent_updates_grist.json
 sync_state.json
 sync_state_g2p.json
+
+# Build artifacts
+build/
+dist/
+release/
+*.spec
+
+# Runtime logs
+logs/

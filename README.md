@@ -1,5 +1,13 @@
 # Playnite <-> Grist Sync
 
+如果使用 exe：
+
+- 只需要 `run_sync_job.exe`。
+- 默认只运行 P2G。
+- 在 `config.yaml` 里设置 `g2p_enabled: true` 才会运行 G2P。
+- 不放心时可手动传 `--g2p-dry-run` 覆盖。
+- 失败时会自动向 Playnite 发送 `error` 通知（需要 `/api/notifications` 可用）。
+
 用于 Playnite 和 Grist 之间的双向同步：
 
 - P2G: 把 Playnite 游戏库同步到 Grist（以 `playniteId` 为主键 upsert）。
@@ -71,13 +79,33 @@ G2P 默认只回写白名单字段（`g2p_fields`）：
 
 ### G2P 配置
 
+- `g2p_enabled`: 是否在统一入口中启用 G2P（默认 `false`）
 - `g2p_fields`: 回写白名单字段（逗号分隔）
-- `g2p_apply`: 默认写回模式（可被命令行参数覆盖）
 - `g2p_state_path`: G2P 状态文件路径（默认 `sync_state_g2p.json`）
 - `g2p_max_pages`: Grist 最大分页数（默认 `2000`）
 - `g2p_incremental_cutoff`: 是否启用增量截断（默认 `true`）
 - `g2p_allow_when_playnite_modified_missing`: Playnite 缺少 modified 时是否允许继续判定（默认 `true`）
-- `g2p_edited_after_sync_grace_seconds`: `editedAt` 相对 `syncedAt` 的生效秒差（默认 `300`）
+
+### 通知
+
+Runner 只在失败时发送 `error` 通知，不发送 `success/info` 通知。
+为避免通知风暴：
+
+- 单次运行最多发送 1 条错误通知。
+- 相同错误在冷却窗口（30 分钟）内只发送一次。
+- 冷却状态保存在 `logs/notify-error-state.json`。
+
+接口使用：
+
+`POST /api/notifications`
+
+请求体示例：
+
+```json
+{"text": "Hello!", "type": "info"}
+```
+
+`type` 支持 `info`（默认）或 `error`，本项目仅使用 `error`。
 
 ### 运行示例
 
@@ -100,6 +128,18 @@ python sync_grist_to_playnite.py --apply
 ```
 
 双向同步：
+
+```bash
+python run_sync_job.py
+```
+
+启用 G2P 后（config 里 `g2p_enabled: true`）：
+
+```bash
+python run_sync_job.py
+```
+
+手动覆盖为 dry-run：
 
 ```bash
 python run_sync_job.py --g2p-dry-run
