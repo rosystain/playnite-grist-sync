@@ -364,8 +364,11 @@ def normalize_game(game: Dict[str, Any]) -> Dict[str, Any]:
     ]:
         row[field] = to_grist_list(row.get(field, []))
 
-    # Convert links to markdown text, example: [DLsite](https://...)
-    row["links"] = links_to_markdown(row.get("links"))
+    # Convert links to markdown text when source payload provides it.
+    # If links is absent (common in list endpoint), skip the field to avoid
+    # overwriting existing Grist links with an empty string.
+    if "links" in row:
+        row["links"] = links_to_markdown(row.get("links"))
 
     # Safety net for unexpected list-valued fields from detail payloads.
     for k, v in list(row.items()):
@@ -858,9 +861,9 @@ def append_missing_choices(config: Config, rows: List[Dict[str, Any]], desired_c
     print("Updated choices for columns: " + ", ".join([u["id"] for u in updates]))
 
 
-def fetch_existing_record_map(config: Config) -> Dict[str, int]:
+def fetch_existing_record_snapshot(config: Config) -> Dict[str, Dict[str, Any]]:
     headers = grist_headers(config)
-    record_map: Dict[str, int] = {}
+    record_map: Dict[str, Dict[str, Any]] = {}
     parsed_any = False
 
     # Prefer SQL pagination because /records offset can be unreliable on some deployments.
@@ -872,7 +875,7 @@ def fetch_existing_record_map(config: Config) -> Dict[str, int]:
     try:
         while True:
             sql = (
-                f"select id, {BUSINESS_KEY} from {table_name_sql} "
+                f"select id, {BUSINESS_KEY}, {EDITED_AT_COLUMN} from {table_name_sql} "
                 f"order by id limit {page_size} offset {offset}"
             )
             payload = grist_sql_query(config, sql)
@@ -886,11 +889,15 @@ def fetch_existing_record_map(config: Config) -> Dict[str, int]:
                 # SQL endpoint may return selected id inside fields.id, not top-level id.
                 rec_id_raw = rec.get("id", fields.get("id"))
                 business_raw = fields.get(BUSINESS_KEY)
+                edited_at_value = fields.get(EDITED_AT_COLUMN)
                 business_id = str(business_raw).strip() if business_raw is not None else ""
                 if rec_id_raw is None or not business_id:
                     continue
                 try:
-                    record_map[business_id] = int(rec_id_raw)
+                    record_map[business_id] = {
+                        "record_id": int(rec_id_raw),
+                        EDITED_AT_COLUMN: edited_at_value,
+                    }
                     parsed_any = True
                 except (TypeError, ValueError):
                     continue
@@ -911,11 +918,15 @@ def fetch_existing_record_map(config: Config) -> Dict[str, int]:
         fields = rec.get("fields", {}) if isinstance(rec.get("fields"), dict) else {}
         rec_id_raw = rec.get("id", fields.get("id"))
         business_raw = fields.get(BUSINESS_KEY)
+        edited_at_value = fields.get(EDITED_AT_COLUMN)
         business_id = str(business_raw).strip() if business_raw is not None else ""
         if rec_id_raw is None or not business_id:
             continue
         try:
-            record_map[business_id] = int(rec_id_raw)
+            record_map[business_id] = {
+                "record_id": int(rec_id_raw),
+                EDITED_AT_COLUMN: edited_at_value,
+            }
             parsed_any = True
         except (TypeError, ValueError):
             continue
@@ -931,13 +942,25 @@ def fetch_existing_record_map(config: Config) -> Dict[str, int]:
     return record_map
 
 
+def fetch_existing_record_map(config: Config) -> Dict[str, int]:
+    snapshot = fetch_existing_record_snapshot(config)
+    out: Dict[str, int] = {}
+    for business_id, info in snapshot.items():
+        if not isinstance(info, dict):
+            continue
+        rec_id = info.get("record_id")
+        if isinstance(rec_id, int):
+            out[business_id] = rec_id
+    return out
+
+
 def chunked(items: List[Any], size: int) -> List[List[Any]]:
     return [items[i : i + size] for i in range(0, len(items), size)]
 
 
 def upsert_records(config: Config, rows: List[Dict[str, Any]]) -> Tuple[int, int]:
     headers = grist_headers(config)
-    existing = fetch_existing_record_map(config)
+    existing_snapshot = fetch_existing_record_snapshot(config)
 
     to_add: List[Dict[str, Any]] = []
     to_update: List[Dict[str, Any]] = []
@@ -948,8 +971,15 @@ def upsert_records(config: Config, rows: List[Dict[str, Any]]) -> Tuple[int, int
         if not isinstance(business_id, str) or not business_id:
             continue
 
-        if business_id in existing:
-            to_update.append({"id": existing[business_id], "fields": row})
+        if business_id in existing_snapshot:
+            snapshot = existing_snapshot[business_id]
+            rec_id = snapshot.get("record_id") if isinstance(snapshot, dict) else None
+            if not isinstance(rec_id, int):
+                continue
+            update_fields = dict(row)
+            if EDITED_AT_COLUMN in snapshot:
+                update_fields[EDITED_AT_COLUMN] = snapshot.get(EDITED_AT_COLUMN)
+            to_update.append({"id": rec_id, "fields": update_fields})
         else:
             to_add.append({"fields": row})
 
@@ -1077,6 +1107,10 @@ def main() -> int:
             need_detail = False
             if config.detail_sync_enabled:
                 if config.detail_full_backfill:
+                    need_detail = True
+                elif "links" not in g:
+                    # Some Playnite Bridge list payloads omit links. Fetch detail
+                    # so links can be filled instead of staying blank.
                     need_detail = True
                 elif game_id not in previous_state:
                     need_detail = True

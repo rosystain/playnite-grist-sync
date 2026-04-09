@@ -10,12 +10,16 @@ Features:
 from __future__ import annotations
 
 import argparse
+import io
 import hashlib
 import json
 import logging
 import os
 import subprocess
 import sys
+import time
+from contextlib import redirect_stderr, redirect_stdout
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
@@ -33,6 +37,31 @@ class NotificationError(Exception):
 
 
 ERROR_NOTIFY_COOLDOWN_SECONDS = 1800
+TRANSIENT_RETRY_SECONDS = 20
+TRANSIENT_RETRY_KEYWORDS = (
+    "connection refused",
+    "timed out",
+    "timeout",
+    "temporarily unavailable",
+    "network is unreachable",
+    "name or service not known",
+    "connection reset",
+    "failed to establish a new connection",
+    "remote end closed connection without response",
+    "remotedisconnected",
+    "getaddrinfo failed",
+    "temporary failure in name resolution",
+    "[winerror 10061]",
+    "[winerror 11001]",
+    "[winerror 10060]",
+)
+
+
+@dataclass
+class StepResult:
+    exit_code: int
+    error_summary: str = ""
+    is_transient_error: bool = False
 
 
 class FileLock:
@@ -253,13 +282,73 @@ def windows_popen_kwargs() -> dict:
     }
 
 
+def summarize_step_output(lines: List[str]) -> str:
+    cleaned = [str(x).strip() for x in lines if str(x).strip()]
+    if not cleaned:
+        return ""
+
+    prioritized = (
+        "error:",
+        "exception:",
+        "http ",
+        "network error",
+        "traceback",
+    )
+    for line in reversed(cleaned):
+        lower = line.lower()
+        if any(lower.startswith(prefix) for prefix in prioritized):
+            return line[:240]
+    return cleaned[-1][:240]
+
+
+def output_has_transient_error(lines: List[str]) -> bool:
+    for line in lines:
+        lower = str(line).lower()
+        if any(keyword in lower for keyword in TRANSIENT_RETRY_KEYWORDS):
+            return True
+    return False
+
+
+def build_failure_notification(step_name: str, result: StepResult) -> str:
+    base = f"Sync failed: {step_name} exit={result.exit_code}"
+    detail = result.error_summary.strip()
+    if detail:
+        return f"{base} | {detail}"[:320]
+    return base
+
+
+def should_notify_step_failure(result: StepResult) -> bool:
+    # Wake/sleep windows often produce short-lived network errors; keep logs,
+    # retry once, but avoid noisy user-facing notifications.
+    return not result.is_transient_error
+
+
+def maybe_retry_transient_step(
+    name: str,
+    first: StepResult,
+    logger: logging.Logger,
+    invoke_once,
+) -> StepResult:
+    if first.exit_code == 0 or not first.is_transient_error:
+        return first
+
+    logger.warning(
+        "%s failed with transient error, retrying once in %ss", name, TRANSIENT_RETRY_SECONDS
+    )
+    time.sleep(TRANSIENT_RETRY_SECONDS)
+    second = invoke_once()
+    if second.exit_code == 0:
+        logger.info("%s retry succeeded after transient failure", name)
+    return second
+
+
 def run_step(
     name: str,
     python_exe: Path,
     script_path: Path,
     logger: logging.Logger,
     script_args: Optional[List[str]] = None,
-) -> int:
+) -> StepResult:
     if script_path.suffix.lower() == ".exe":
         cmd = [str(script_path)]
     else:
@@ -280,21 +369,49 @@ def run_step(
         **windows_popen_kwargs(),
     )
 
+    out_lines: List[str] = []
     assert process.stdout is not None
     for line in process.stdout:
-        logger.info("[%s] %s", name, line.rstrip())
+        text = line.rstrip()
+        out_lines.append(text)
+        if len(out_lines) > 60:
+            out_lines.pop(0)
+        logger.info("[%s] %s", name, text)
 
     code = process.wait()
+    summary = summarize_step_output(out_lines)
+    transient = output_has_transient_error(out_lines)
     if code == 0:
         logger.info("Step success: %s", name)
     else:
         logger.error("Step failed: %s (exit=%s)", name, code)
-    return code
+    return StepResult(exit_code=code, error_summary=summary, is_transient_error=transient)
 
 
-def run_embedded_step(name: str, module_name: str, logger: logging.Logger, script_args: Optional[List[str]] = None) -> int:
+def run_embedded_step(name: str, module_name: str, logger: logging.Logger, script_args: Optional[List[str]] = None) -> StepResult:
     logger.info("Step start (embedded): %s", name)
     logger.info("Module: %s Args: %s", module_name, " ".join(script_args or []))
+    stdout_buffer = io.StringIO()
+    stderr_buffer = io.StringIO()
+
+    def flush_embedded_output() -> List[str]:
+        merged_lines: List[str] = []
+        out_text = stdout_buffer.getvalue()
+        if out_text:
+            for line in out_text.splitlines():
+                text = line.rstrip()
+                merged_lines.append(text)
+                logger.info("[%s] %s", name, text)
+
+        err_text = stderr_buffer.getvalue()
+        if err_text:
+            for line in err_text.splitlines():
+                text = line.rstrip()
+                merged_lines.append(text)
+                logger.error("[%s] %s", name, text)
+
+        return merged_lines
+
     try:
         if module_name == "sync_playnite_to_grist":
             import sync_playnite_to_grist as mod
@@ -305,19 +422,31 @@ def run_embedded_step(name: str, module_name: str, logger: logging.Logger, scrip
         old_argv = list(sys.argv)
         sys.argv = [module_name + ".py", *(script_args or [])]
         try:
-            code = int(mod.main())
+            with redirect_stdout(stdout_buffer), redirect_stderr(stderr_buffer):
+                code = int(mod.main())
         finally:
             sys.argv = old_argv
     except Exception as exc:
+        lines = flush_embedded_output()
         logger.exception("Step crashed: %s", name)
         logger.error("Exception: %s", exc)
-        return 1
+        lines.append(f"Exception: {exc}")
+        return StepResult(
+            exit_code=1,
+            error_summary=summarize_step_output(lines),
+            is_transient_error=output_has_transient_error(lines),
+        )
 
+    lines = flush_embedded_output()
     if code == 0:
         logger.info("Step success: %s", name)
     else:
         logger.error("Step failed: %s (exit=%s)", name, code)
-    return code
+    return StepResult(
+        exit_code=code,
+        error_summary=summarize_step_output(lines),
+        is_transient_error=output_has_transient_error(lines),
+    )
 
 
 def resolve_path(base_dir: Path, value: str) -> Path:
@@ -402,16 +531,28 @@ def main() -> int:
 
         if not args.skip_p2g:
             if p2g_path.exists():
-                p2g_code = run_step("P2G", python_exe, p2g_path, logger)
+                p2g_result = run_step("P2G", python_exe, p2g_path, logger)
+                p2g_result = maybe_retry_transient_step(
+                    "P2G", p2g_result, logger, lambda: run_step("P2G", python_exe, p2g_path, logger)
+                )
             elif is_frozen():
-                p2g_code = run_embedded_step("P2G", "sync_playnite_to_grist", logger)
+                p2g_result = run_embedded_step("P2G", "sync_playnite_to_grist", logger)
+                p2g_result = maybe_retry_transient_step(
+                    "P2G",
+                    p2g_result,
+                    logger,
+                    lambda: run_embedded_step("P2G", "sync_playnite_to_grist", logger),
+                )
             else:
                 logger.error("P2G target not found: %s", p2g_path)
                 notify_if_needed("error", "Sync failed: P2G target not found")
                 return 3
-            if p2g_code != 0 and not args.continue_on_error:
-                notify_if_needed("error", f"Sync failed: P2G exit={p2g_code}")
-                return p2g_code
+            if p2g_result.exit_code != 0 and not args.continue_on_error:
+                if should_notify_step_failure(p2g_result):
+                    notify_if_needed("error", build_failure_notification("P2G", p2g_result))
+                else:
+                    logger.warning("P2G failed with transient network error; notification suppressed")
+                return p2g_result.exit_code
 
         g2p_enabled = read_g2p_enabled(config_path)
         should_run_g2p = (not args.skip_g2p) and (args.g2p_apply or args.g2p_dry_run or g2p_enabled)
@@ -425,16 +566,31 @@ def main() -> int:
                 g2p_args.append("--dry-run")
 
             if g2p_path.exists():
-                g2p_code = run_step("G2P", python_exe, g2p_path, logger, g2p_args)
+                g2p_result = run_step("G2P", python_exe, g2p_path, logger, g2p_args)
+                g2p_result = maybe_retry_transient_step(
+                    "G2P",
+                    g2p_result,
+                    logger,
+                    lambda: run_step("G2P", python_exe, g2p_path, logger, g2p_args),
+                )
             elif is_frozen():
-                g2p_code = run_embedded_step("G2P", "sync_grist_to_playnite", logger, g2p_args)
+                g2p_result = run_embedded_step("G2P", "sync_grist_to_playnite", logger, g2p_args)
+                g2p_result = maybe_retry_transient_step(
+                    "G2P",
+                    g2p_result,
+                    logger,
+                    lambda: run_embedded_step("G2P", "sync_grist_to_playnite", logger, g2p_args),
+                )
             else:
                 logger.error("G2P target not found: %s", g2p_path)
                 notify_if_needed("error", "Sync failed: G2P target not found")
                 return 3
-            if g2p_code != 0 and not args.continue_on_error:
-                notify_if_needed("error", f"Sync failed: G2P exit={g2p_code}")
-                return g2p_code
+            if g2p_result.exit_code != 0 and not args.continue_on_error:
+                if should_notify_step_failure(g2p_result):
+                    notify_if_needed("error", build_failure_notification("G2P", g2p_result))
+                else:
+                    logger.warning("G2P failed with transient network error; notification suppressed")
+                return g2p_result.exit_code
 
         logger.info("Sync job completed")
         return 0
