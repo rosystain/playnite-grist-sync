@@ -37,6 +37,7 @@ class NotificationError(Exception):
 
 
 ERROR_NOTIFY_COOLDOWN_SECONDS = 1800
+LOCK_STALE_SECONDS = 12 * 3600
 TRANSIENT_RETRY_SECONDS = 20
 TRANSIENT_RETRY_KEYWORDS = (
     "connection refused",
@@ -65,16 +66,92 @@ class StepResult:
 
 
 class FileLock:
-    def __init__(self, lock_path: Path) -> None:
+    def __init__(self, lock_path: Path, logger: Optional[logging.Logger] = None) -> None:
         self.lock_path = lock_path
         self.fd: Optional[int] = None
+        self.logger = logger
+
+    def _log(self, level: str, message: str, *args: object) -> None:
+        if self.logger is None:
+            return
+        if level == "warning":
+            self.logger.warning(message, *args)
+        else:
+            self.logger.info(message, *args)
+
+    def _read_lock_meta(self) -> tuple[Optional[int], Optional[datetime]]:
+        try:
+            lines = self.lock_path.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            return None, None
+
+        pid: Optional[int] = None
+        started_at: Optional[datetime] = None
+        for line in lines:
+            if line.startswith("pid="):
+                raw = line.split("=", 1)[1].strip()
+                if raw.isdigit():
+                    pid = int(raw)
+            elif line.startswith("startedAt="):
+                started_at = parse_iso_utc(line.split("=", 1)[1].strip())
+        return pid, started_at
+
+    @staticmethod
+    def _pid_alive(pid: int) -> bool:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            # Process exists but is not accessible by current user.
+            return True
+        except OSError:
+            return False
+        return True
+
+    def _is_stale_lock(self) -> bool:
+        pid, started_at = self._read_lock_meta()
+        now = datetime.now(timezone.utc)
+
+        if pid is not None and not self._pid_alive(pid):
+            self._log("warning", "Stale lock detected: pid %s no longer exists", pid)
+            return True
+
+        if started_at is not None and (now - started_at).total_seconds() > LOCK_STALE_SECONDS:
+            self._log(
+                "warning",
+                "Stale lock detected: startedAt=%s older than %ss",
+                started_at.isoformat(),
+                LOCK_STALE_SECONDS,
+            )
+            return True
+
+        return False
+
+    def _break_stale_lock(self) -> bool:
+        if not self.lock_path.exists():
+            return False
+        if not self._is_stale_lock():
+            return False
+        try:
+            self.lock_path.unlink(missing_ok=True)
+            self._log("warning", "Removed stale lock file: %s", self.lock_path)
+            return True
+        except OSError:
+            return False
 
     def acquire(self) -> None:
         self.lock_path.parent.mkdir(parents=True, exist_ok=True)
-        try:
-            self.fd = os.open(str(self.lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-        except FileExistsError as exc:
-            raise LockError(f"Lock already exists: {self.lock_path}") from exc
+        for attempt in range(2):
+            try:
+                self.fd = os.open(str(self.lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                break
+            except FileExistsError as exc:
+                if attempt == 0 and self._break_stale_lock():
+                    continue
+                raise LockError(f"Lock already exists: {self.lock_path}") from exc
+        if self.fd is None:
+            raise LockError(f"Unable to acquire lock: {self.lock_path}")
 
         payload = (
             f"pid={os.getpid()}\n"
@@ -486,7 +563,7 @@ def main() -> int:
     notify_state_file = resolve_path(base_dir, "logs/notify-error-state.json")
 
     logger = setup_logger(log_file, args.log_max_mb, args.log_backups)
-    lock = FileLock(lock_file)
+    lock = FileLock(lock_file, logger)
 
     try:
         lock.acquire()
